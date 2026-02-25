@@ -1,91 +1,122 @@
-import requests
-from bs4 import BeautifulSoup
-import json
+"""Ollama technology concept assistant with SaaS-style Gradio UI."""
+
+from __future__ import annotations
+
 from datetime import datetime
 
-# Constants for Ollama API
+import gradio as gr
+import requests
+
 OLLAMA_API = "http://localhost:11434/api/generate"
+OLLAMA_VERSION = "http://localhost:11434/api/version"
 OLLAMA_HEADERS = {"Content-Type": "application/json"}
-MODEL = "llama3.2"  # Change this to your installed model name
+MODEL_NAME = "llama3.2"
 
-def check_ollama():
-    """Check if Ollama is running and accessible"""
-    try:
-        response = requests.get("http://localhost:11434/api/version")
-        if response.status_code == 200:
-            print("✓ Ollama is running and accessible")
-            return True
-        else:
-            print(f"✗ Error connecting to Ollama: {response.status_code}")
-            return False
-    except requests.exceptions.ConnectionError:
-        print("✗ Error: Cannot connect to Ollama. Make sure Ollama is installed and running.")
-        print("  Installation instructions:")
-        print("  - Mac/Linux: curl https://ollama.ai/install.sh | sh")
-        print("  - Windows: Download from https://ollama.ai")
-        return False
-    except Exception as e:
-        print(f"✗ Error connecting to Ollama: {e}")
-        return False
+SYSTEM_PROMPT = (
+    "You are a technical AI assistant. Respond in markdown using this format: "
+    "1) What it is, 2) How it was created, 3) Practical use in SaaS products."
+)
 
-def generate_answer(question, system_prompt):
-    """Generate answer using Ollama"""
-    if not check_ollama():
-        return None
-        
-    payload = {
-        "model": MODEL,
-        "prompt": f"### System: {system_prompt}\n\n### User: {question}\n\n### Assistant:",
-        "stream": False
-    }
-    
-    try:
-        response = requests.post(OLLAMA_API, headers=OLLAMA_HEADERS, json=payload)
-        response.raise_for_status()
-        return response.json().get("response", "No response generated.")
-    except requests.exceptions.RequestException as e:
-        print(f"Error generating response: {e}")
-        return None
-
-def main():
-    # System prompt definition
-    system_prompt = """You are an assistant that explains technology concepts, including code, math, debugging, and AI. 
-    Focus on fundamentals and answer in a structured way using markdown formatting:
-    1. What it is
-    2. How it was created
-    3. Its practical use
-    
-    Format your response in clear markdown with headers, lists, and code examples where appropriate."""
-    
-    # Example question about vector databases
-    question = "Explain to me how vector databases storage for AI works."
-    
-    print("\nGenerating response...\n")
-    response = generate_answer(question, system_prompt)
-    
-    if response:
-        # Create markdown output
-        output = f"""# Technology Concept Explanation
-Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-## Query
-{question}
-
-## Response
-{response}
-
----
-*Generated using Ollama with {MODEL} model*
+CSS = """
+:root {
+  --ink-950: #07070C;
+  --ink-900: #0B0C12;
+  --line: rgba(255, 255, 255, 0.14);
+  --line-strong: rgba(255, 255, 255, 0.24);
+  --text: #F2F7FF;
+  --muted: rgba(242, 247, 255, 0.72);
+  --neon-1: #3ADAD5;
+  --neon-2: #3AE0CA;
+  --neon-3: #39C3F2;
+}
+.gradio-container {
+  font-family: 'Inter', 'Segoe UI', sans-serif;
+  background:
+    radial-gradient(900px 420px at 20% 15%, rgba(58, 218, 213, 0.14), transparent 55%),
+    radial-gradient(700px 360px at 82% 28%, rgba(57, 195, 242, 0.12), transparent 55%),
+    linear-gradient(180deg, var(--ink-950) 0%, var(--ink-900) 45%, var(--ink-950) 100%);
+  color: var(--text);
+}
+.gradio-container .prose,
+.gradio-container label,
+.gradio-container .gr-markdown {
+  color: var(--text) !important;
+}
+.gradio-container .gr-box,
+.gradio-container .gr-form,
+.gradio-container .gr-panel,
+.gradio-container .gr-group {
+  background: rgba(15, 18, 32, 0.58) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 16px !important;
+}
+.gradio-container input,
+.gradio-container textarea,
+.gradio-container select {
+  background: rgba(11, 12, 18, 0.85) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--line-strong) !important;
+}
+.gradio-container input::placeholder,
+.gradio-container textarea::placeholder {
+  color: var(--muted) !important;
+}
+button.primary {
+  background: linear-gradient(90deg, var(--neon-3), var(--neon-2)) !important;
+  color: #0B0C12 !important;
+  border: 1px solid rgba(58, 218, 213, 0.35) !important;
+  font-weight: 800 !important;
+}
 """
-        
-        # Print to console and save to file
-        print(output)
-        
-        # Save to markdown file
-        filename = "tech_explanation.md"
-        with open(filename, "w") as f:
-            f.write(output)
-        print(f"\nResponse saved to {filename}")
+
+
+def ollama_is_ready() -> bool:
+    try:
+        response = requests.get(OLLAMA_VERSION, timeout=5)
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def generate_answer(question: str) -> str:
+    if not ollama_is_ready():
+        return "# Ollama Offline\nStart Ollama locally and try again."
+
+    payload = {
+        "model": MODEL_NAME,
+        "prompt": f"### System: {SYSTEM_PROMPT}\n\n### User: {question}\n\n### Assistant:",
+        "stream": False,
+    }
+    response = requests.post(OLLAMA_API, headers=OLLAMA_HEADERS, json=payload, timeout=60)
+    response.raise_for_status()
+    body = response.json().get("response", "No response generated.")
+
+    return (
+        "# Technology Concept Explanation\n"
+        f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"## Query\n{question}\n\n"
+        f"## Response\n{body}\n\n"
+        f"---\nGenerated using {MODEL_NAME}"
+    )
+
+
+def build_interface() -> gr.Blocks:
+    with gr.Blocks(title="Ollama Tech Assistant", theme=gr.themes.Soft(), css=CSS) as demo:
+        gr.Markdown("# Ollama Tech Assistant\nCalm technical responses for AI SaaS portfolio demos.")
+        question = gr.Textbox(
+            label="Question",
+            value="Explain how vector database storage for AI works.",
+            lines=3,
+        )
+        ask_button = gr.Button("Generate Answer", variant="primary")
+        output = gr.Markdown()
+        ask_button.click(generate_answer, inputs=question, outputs=output)
+    return demo
+
+
+def main() -> None:
+    print(generate_answer("Explain how vector database storage for AI works."))
+
 
 if __name__ == "__main__":
-    main()
+    build_interface().launch()

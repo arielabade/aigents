@@ -1,152 +1,260 @@
-import os
-import requests
+"""Streaming brochure generator with portfolio-grade Gradio interface."""
+
+from __future__ import annotations
+
 import json
-from typing import List
-from dotenv import load_dotenv
+import os
+from dataclasses import dataclass
+from typing import Dict, List
+from urllib.parse import urljoin
+
+import gradio as gr
+import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from openai import OpenAI
+from openai import OpenAIError
+
+load_dotenv(override=True)
+
+MODEL_NAME = "gemini-2.0-flash"
 
 
-# Load environment variables
-class Config:
-    def __init__(self):
-        load_dotenv(override=True)
-        self.api_key = os.getenv('OPENAI_API_KEY')
-        self.model = 'gpt-4o-mini'
-        self.openai = OpenAI() 
+def get_openai_client() -> OpenAI:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise OpenAIError(
+            "GEMINI_API_KEY is missing. The UI can run without it, but brochure generation requires it."
+        )
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
 
-    def validate_api_key(self):
-        if self.api_key and self.api_key.startswith('sk-proj-') and len(self.api_key) > 10:
-            print("API key looks good so far")
+SCRAPE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
+}
+
+CSS = """
+:root {
+  --ink-950: #07070C;
+  --ink-900: #0B0C12;
+  --line: rgba(255, 255, 255, 0.14);
+  --line-strong: rgba(255, 255, 255, 0.24);
+  --text: #F2F7FF;
+  --muted: rgba(242, 247, 255, 0.72);
+  --neon-1: #3ADAD5;
+  --neon-2: #3AE0CA;
+  --neon-3: #39C3F2;
+}
+.gradio-container {
+  font-family: 'Inter', 'Segoe UI', sans-serif;
+  background:
+    radial-gradient(900px 420px at 20% 15%, rgba(58, 218, 213, 0.14), transparent 55%),
+    radial-gradient(700px 360px at 82% 28%, rgba(57, 195, 242, 0.12), transparent 55%),
+    linear-gradient(180deg, var(--ink-950) 0%, var(--ink-900) 45%, var(--ink-950) 100%);
+  color: var(--text);
+}
+.gradio-container .prose,
+.gradio-container label,
+.gradio-container .gr-markdown {
+  color: var(--text) !important;
+}
+.gradio-container .gr-box,
+.gradio-container .gr-form,
+.gradio-container .gr-panel,
+.gradio-container .gr-group {
+  background: rgba(15, 18, 32, 0.58) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 16px !important;
+}
+.gradio-container input,
+.gradio-container textarea,
+.gradio-container select {
+  background: rgba(11, 12, 18, 0.85) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--line-strong) !important;
+}
+.gradio-container input::placeholder,
+.gradio-container textarea::placeholder {
+  color: var(--muted) !important;
+}
+#brochure-shell {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(15, 18, 32, 0.52);
+  backdrop-filter: blur(12px);
+}
+button.primary {
+  background: linear-gradient(90deg, var(--neon-3), var(--neon-2)) !important;
+  color: #0B0C12 !important;
+  border: 1px solid rgba(58, 218, 213, 0.35) !important;
+  font-weight: 800 !important;
+}
+"""
+
+
+@dataclass
+class Website:
+    url: str
+    title: str
+    text: str
+    links: List[str]
+
+    @classmethod
+    def from_url(cls, url: str) -> "Website":
+        response = requests.get(url, headers=SCRAPE_HEADERS, timeout=20)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, "html.parser")
+        title = soup.title.string.strip() if soup.title and soup.title.string else "No title found"
+
+        links = []
+        for tag in soup.find_all("a"):
+            href = tag.get("href")
+            if href:
+                links.append(urljoin(url, href))
+
+        if soup.body:
+            for noisy in soup.body.find_all(["script", "style", "img", "input", "noscript"]):
+                noisy.decompose()
+            text = soup.body.get_text(separator="\n", strip=True)
         else:
-            print("There might be a problem with your API key. Please visit the troubleshooting notebook!")
+            text = ""
+
+        return cls(url=url, title=title, text=text, links=links)
 
 
-# Class to handle API communication with OpenAI
-class OpenAICommunicator:
-    def __init__(self, openai_instance, model):
-        self.openai = openai_instance
+class BrochureCreator:
+    def __init__(self, model: str = MODEL_NAME):
         self.model = model
 
-    def get_response(self, system_prompt, user_prompt):
+    def pick_relevant_links(self, website: Website) -> Dict[str, List[Dict[str, str]]]:
+        client = get_openai_client()
+        system_prompt = (
+            "Select brochure-relevant links from a company website. "
+            "Respond in JSON with key 'links', each item containing 'type' and 'url'."
+        )
+        user_prompt = (
+            f"Website: {website.url}\n"
+            "Ignore privacy, terms, and social links. Prioritize about, product, pricing, docs, careers.\n\n"
+            + "\n".join(website.links[:80])
+        )
+
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        user_prompt
+                        + "\n\nReturn ONLY valid JSON in this schema: "
+                        + '{"links":[{"type":"about page","url":"https://example.com/about"}]}'
+                    ),
+                },
+            ],
+        )
+
+        content = response.choices[0].message.content or '{"links": []}'
         try:
-            response = self.openai.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ]
-            )
-            response_content = response.choices[0].message.content
-            if not response_content:
-                print("Error: Empty response from OpenAI")
-                return "{}"  # Return empty JSON structure
-            return response_content
-        except Exception as e:
-            print(f"Error fetching response from OpenAI: {e}")
-            return "{}"  # Return empty JSON structure in case of error
+            return json.loads(content)
+        except json.JSONDecodeError:
+            start = content.find("{")
+            end = content.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return json.loads(content[start : end + 1])
+                except json.JSONDecodeError:
+                    pass
+            return {"links": []}
+
+    def gather_context(self, company_name: str, website_url: str) -> str:
+        landing = Website.from_url(website_url)
+        link_map = self.pick_relevant_links(landing)
+
+        blocks = [f"## Company\n{company_name}", f"## Landing Page\n{landing.text[:5000]}"]
+
+        for item in link_map.get("links", [])[:3]:
+            link_type = item.get("type", "Additional Page")
+            link_url = item.get("url", "")
+            if not link_url:
+                continue
+            page = Website.from_url(link_url)
+            blocks.append(f"## {link_type}\n{page.text[:3500]}")
+
+        return "\n\n".join(blocks)
+
+    def stream_brochure(self, company_name: str, website_url: str, extra_requirements: str):
+        client = get_openai_client()
+        context = self.gather_context(company_name, website_url)
+        system_prompt = (
+            "You create high-converting B2B AI SaaS brochures in markdown. "
+            "Include: Overview, Product Value, Why It Wins, Social Proof, CTA."
+        )
+        user_prompt = (
+            f"Company: {company_name}\n"
+            f"Extra requirements: {extra_requirements}\n\n"
+            f"Website context:\n{context[:14000]}"
+        )
+
+        stream = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            stream=True,
+        )
+
+        partial = ""
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            partial += delta
+            yield partial
 
 
-# Class to represent a Website and extract its content
-class Website:
-    def __init__(self, url):
-        self.url = url
-        self.body = self._fetch_website_content()
-        self.title, self.text, self.links = self._parse_content()
+def build_interface() -> gr.Blocks:
+    creator = BrochureCreator()
 
-    def _fetch_website_content(self):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
-        }
-        response = requests.get(self.url, headers=headers)
-        return response.content
+    with gr.Blocks(title="AI Brochure Studio", theme=gr.themes.Soft(), css=CSS) as demo:
+        gr.Markdown("# AI Brochure Studio\nStreaming brochure generation for SaaS portfolio projects.")
+        with gr.Row(elem_id="brochure-shell"):
+            with gr.Column(scale=1):
+                company_name = gr.Textbox(label="Company Name", value="Vellum")
+                website_url = gr.Textbox(label="Website URL", value="https://www.vellum.ai")
+                extra = gr.Textbox(
+                    label="Extra Requirements",
+                    value="Highlight enterprise reliability and AI workflow governance.",
+                    lines=4,
+                )
+                generate = gr.Button("Generate Brochure", variant="primary")
+            with gr.Column(scale=2):
+                brochure = gr.Markdown(label="Brochure")
 
-    def _parse_content(self):
-        soup = BeautifulSoup(self.body, 'html.parser')
-        title = soup.title.string if soup.title else "No title found"
-        text = ""
-        if soup.body:
-            for irrelevant in soup.body(["script", "style", "img", "input"]):
-                irrelevant.decompose()
-            text = soup.body.get_text(separator="\n", strip=True)
-        links = [link.get('href') for link in soup.find_all('a') if link.get('href')]
-        return title, text, links
+        generate.click(
+            creator.stream_brochure,
+            inputs=[company_name, website_url, extra],
+            outputs=brochure,
+        )
 
-    def get_contents(self):
-        return f"## Webpage Title:\n{self.title}\n\n## Webpage Contents:\n{self.text}\n\n"
+    return demo
 
 
-# Class for Brochure creation logic
-class BrochureCreator:
-    def __init__(self, company_name, url, openai_communicator):
-        self.company_name = company_name
-        self.url = url
-        self.openai_communicator = openai_communicator
-
-    def _get_links_user_prompt(self, website):
-        user_prompt = f"Here is the list of links on the website of {website.url} - "
-        user_prompt += "please decide which of these are relevant web links for a brochure about the company, respond with the full https URL in JSON format. \
-Do not include Terms of Service, Privacy, or email links.\n"
-        user_prompt += "Links (some might be relative links):\n"
-        user_prompt += "\n".join(website.links)
-        return user_prompt
-
-    def _get_links(self, website):
-        link_system_prompt = "You are provided with a list of links found on a webpage. \
-You are able to decide which of the links would be most relevant to include in a brochure about the company, \
-such as links to an About page, or a Company page, or Careers/Jobs pages.\n"
-        link_system_prompt += "You should respond in JSON format as shown in the example below:\n"
-        link_system_prompt += """
-        {
-            "links": [
-                {"type": "about page", "url": "https://full.url/goes/here/about"},
-                {"type": "careers page", "url": "https://another.full.url/careers"}
-            ]
-        }
-        """
-        user_prompt = self._get_links_user_prompt(website)
-        response_content = self.openai_communicator.get_response(link_system_prompt, user_prompt)
-        try:
-            return json.loads(response_content)
-        except json.JSONDecodeError as e:
-            print(f"Error decoding JSON: {e}")
-            return {"links": []}  # Return empty links in case of error
-
-    def _get_all_details(self):
-        website = Website(self.url)
-        result = f"## Landing page:\n{website.get_contents()}"
-        links = self._get_links(website)
-        print("Found links:", links)
-        for link in links["links"]:
-            result += f"\n\n## {link['type']}:\n"
-            result += Website(link["url"]).get_contents()
-        return result
-
-    def _get_brochure_user_prompt(self):
-        user_prompt = f"You are looking at a company called: {self.company_name}\n"
-        user_prompt += f"Here are the contents of its landing page and other relevant pages; use this information to build a short brochure of the company in markdown.\n"
-        user_prompt += self._get_all_details()
-        user_prompt = user_prompt[:5_000]  # Truncate if more than 5,000 characters
-        return user_prompt
-
-    def create_brochure(self):
-        system_prompt = "You are an assistant that analyzes the contents of several relevant pages from a company website \
-and creates a short brochure about the company for prospective customers, investors, and recruits. Respond in markdown.\
-Include details of company culture, customers, and careers/jobs if you have the information."
-        user_prompt = self._get_brochure_user_prompt()
-        markdown_response = self.openai_communicator.get_response(system_prompt, user_prompt)
-        return markdown_response
+def generate_brochure() -> None:
+    creator = BrochureCreator()
+    output = ""
+    for chunk in creator.stream_brochure(
+        "Vellum",
+        "https://www.vellum.ai",
+        "Highlight enterprise reliability and workflow orchestration.",
+    ):
+        output = chunk
+    print(output)
 
 
-# Main Function to Execute Brochure Creation
-def generate_brochure():
-    config = Config()
-    config.validate_api_key()
-    openai_communicator = OpenAICommunicator(config.openai, config.model)
-    brochure_creator = BrochureCreator("vellum", "https://www.vellum.ai", openai_communicator)
-    brochure_content = brochure_creator.create_brochure()
-    print("Generated Brochure in Markdown:\n")
-    print(brochure_content)
-
-
-generate_brochure()
+if __name__ == "__main__":
+    build_interface().launch()
